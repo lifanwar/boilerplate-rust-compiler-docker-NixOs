@@ -1,0 +1,5 @@
+/target
+/.boilerplate.env
+/.boilerplate/state/*
+!/.boilerplate/state/.gitkeep
+*.log

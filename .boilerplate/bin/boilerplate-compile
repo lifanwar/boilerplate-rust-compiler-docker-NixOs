@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+COMPOSE_FILE="${ROOT}/.boilerplate/compose.yml"
+STATE_DIR="${ROOT}/.boilerplate/state"
+CONFIG_FILE="${BOILERPLATE_CONFIG:-${ROOT}/.boilerplate.env}"
+IMAGE_NAME="boilerplate-compile-rust:stable"
+SHARED_REGISTRY="boilerplate-compile-cargo-registry"
+SHARED_GIT="boilerplate-compile-cargo-git"
+
+cd "$ROOT"
+mkdir -p "$STATE_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  set +a
+fi
+
+VPS_SSH="${VPS_SSH:-}"
+VPS_SSH_PORT="${VPS_SSH_PORT:-22}"
+APP_PORT="${APP_PORT:-3000}"
+LOCAL_PORT="${LOCAL_PORT:-$APP_PORT}"
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || fail "Perintah '$1' tidak tersedia. Masuk melalui nix-shell."
+}
+
+package_name() {
+  cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | jq -r '.packages[0].name // empty'
+}
+
+safe_name() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+    | cut -c1-32
+}
+
+ensure_project_id() {
+  local id_file="${STATE_DIR}/project-id"
+  if [[ ! -s "$id_file" ]]; then
+    local name random
+    name="$(safe_name "$(package_name || basename "$ROOT")")"
+    [[ -n "$name" ]] || name="rust-project"
+    random="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '%s-%s\n' "$name" "$random" > "$id_file"
+  fi
+  PROJECT_ID="$(cat "$id_file")"
+  COMPOSE_PROJECT_NAME="bc-${PROJECT_ID}"
+
+  if [[ -z "${REMOTE_PORT:-}" ]]; then
+    local checksum
+    checksum="$(printf '%s' "$PROJECT_ID" | cksum | awk '{print $1}')"
+    REMOTE_PORT="$((40000 + checksum % 20000))"
+  fi
+
+  export PROJECT_ID COMPOSE_PROJECT_NAME APP_PORT LOCAL_PORT REMOTE_PORT
+}
+
+select_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE=(docker-compose)
+  else
+    fail "Docker Compose tidak tersedia."
+  fi
+}
+
+compose() {
+  "${COMPOSE[@]}" \
+    --project-directory "${ROOT}/.boilerplate" \
+    -f "$COMPOSE_FILE" \
+    -p "$COMPOSE_PROJECT_NAME" \
+    "$@"
+}
+
+configure_remote() {
+  [[ -n "$VPS_SSH" ]] || fail "Salin .boilerplate.env.example menjadi .boilerplate.env, lalu isi VPS_SSH."
+
+  export DOCKER_HOST="ssh://${VPS_SSH}:${VPS_SSH_PORT}"
+  export COMPOSE_DOCKER_CLI_BUILD=1
+  export DOCKER_BUILDKIT=1
+}
+
+preflight() {
+  need cargo
+  need docker
+  need file
+  need jq
+  need patchelf
+  need ssh
+  need tar
+
+  configure_remote
+  select_compose
+
+  ssh \
+    -p "$VPS_SSH_PORT" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    "$VPS_SSH" true \
+    || fail "SSH ke ${VPS_SSH} gagal."
+
+  docker info >/dev/null \
+    || fail "Docker daemon pada VPS tidak dapat diakses oleh ${VPS_SSH}."
+}
+
+ensure_shared_volumes() {
+  docker volume inspect "$SHARED_REGISTRY" >/dev/null 2>&1 \
+    || docker volume create \
+      --label com.boilerplate-compile.managed=true \
+      --label com.boilerplate-compile.shared=true \
+      "$SHARED_REGISTRY" >/dev/null
+
+  docker volume inspect "$SHARED_GIT" >/dev/null 2>&1 \
+    || docker volume create \
+      --label com.boilerplate-compile.managed=true \
+      --label com.boilerplate-compile.shared=true \
+      "$SHARED_GIT" >/dev/null
+}
+
+ensure_builder_image() {
+  local hash_file="${STATE_DIR}/builder-hash"
+  local current_hash previous_hash=""
+  current_hash="$(sha256sum "${ROOT}/.boilerplate/docker/Dockerfile" | awk '{print $1}')"
+  [[ -f "$hash_file" ]] && previous_hash="$(cat "$hash_file")"
+
+  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 \
+      || [[ "$current_hash" != "$previous_hash" ]]; then
+    printf 'Membangun image builder di VPS...\n' >&2
+    compose build workspace >&2
+    printf '%s\n' "$current_hash" > "$hash_file"
+  fi
+}
+
+ensure_workspace() {
+  ensure_shared_volumes
+  ensure_builder_image
+  compose up -d workspace >/dev/null
+}
+
+ensure_lockfile() {
+  if [[ ! -f Cargo.lock ]]; then
+    printf 'Membuat Cargo.lock lokal...\n' >&2
+    cargo generate-lockfile
+  fi
+}
+
+sync_source() {
+  ensure_lockfile
+  ensure_workspace
+  printf 'Mengirim source ke workspace VPS...\n' >&2
+
+  tar \
+    --exclude='./.git' \
+    --exclude='./target' \
+    --exclude='./result' \
+    --exclude='./dist' \
+    --exclude='./.direnv' \
+    --exclude='./.boilerplate.env' \
+    --exclude='./.boilerplate/state' \
+    -C "$ROOT" -cf - . \
+  | compose exec -T workspace sh -lc '
+      find /workspace -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf -- {} +
+      tar -xf - -C /workspace
+    '
+}
+
+detect_bin() {
+  local requested="${1:-}"
+  if [[ -n "$requested" ]]; then
+    printf '%s\n' "$requested"
+    return
+  fi
+
+  local count
+  count="$(cargo metadata --no-deps --format-version 1 \
+    | jq '[.packages[0].targets[] | select(.kind | index("bin"))] | length')"
+
+  [[ "$count" -gt 0 ]] || fail "Target binary tidak ditemukan."
+  [[ "$count" -eq 1 ]] || fail "Ada lebih dari satu binary. Gunakan --bin NAMA."
+
+  cargo metadata --no-deps --format-version 1 \
+    | jq -r '.packages[0].targets[] | select(.kind | index("bin")) | .name'
+}
+
+fix_local_binary() {
+  local binary="$1"
+
+  if file "$binary" | grep -q 'ELF.*dynamically linked'; then
+    [[ -n "${BOILERPLATE_DYNAMIC_LINKER:-}" ]] \
+      || fail "BOILERPLATE_DYNAMIC_LINKER tidak tersedia. Jalankan melalui nix-shell."
+
+    local old_rpath=""
+    old_rpath="$(patchelf --print-rpath "$binary" 2>/dev/null || true)"
+
+    patchelf --set-interpreter "$BOILERPLATE_DYNAMIC_LINKER" "$binary"
+
+    if [[ -n "${BOILERPLATE_LIBRARY_PATH:-}" ]]; then
+      if [[ -n "$old_rpath" ]]; then
+        patchelf --set-rpath "${BOILERPLATE_LIBRARY_PATH}:${old_rpath}" "$binary"
+      else
+        patchelf --set-rpath "$BOILERPLATE_LIBRARY_PATH" "$binary"
+      fi
+    fi
+  fi
+}
+
+RELEASE=0
+BIN_REQUEST=""
+CARGO_ARGS=()
+PROGRAM_ARGS=()
+
+parse_build_args() {
+  RELEASE=0
+  BIN_REQUEST=""
+  CARGO_ARGS=()
+  PROGRAM_ARGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --release)
+        RELEASE=1
+        shift
+        ;;
+      --bin)
+        [[ $# -ge 2 ]] || fail "--bin membutuhkan nama binary."
+        BIN_REQUEST="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        PROGRAM_ARGS=("$@")
+        break
+        ;;
+      *)
+        CARGO_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+remote_build_and_copy() {
+  local bin_name="$1"
+  local profile="debug"
+  local release_args=()
+
+  if [[ "$RELEASE" -eq 1 ]]; then
+    profile="release"
+    release_args=(--release)
+  fi
+
+  sync_source
+
+  printf 'Compile %s di VPS...\n' "$bin_name" >&2
+  compose exec -T workspace \
+    cargo build "${release_args[@]}" --bin "$bin_name" "${CARGO_ARGS[@]}"
+
+  local output_dir="${ROOT}/target/remote/${profile}"
+  local destination="${output_dir}/${bin_name}"
+  local temporary="${destination}.tmp"
+
+  mkdir -p "$output_dir"
+  rm -f "$temporary"
+
+  compose cp \
+    "workspace:/workspace/target/${profile}/${bin_name}" \
+    "$temporary" >&2
+
+  chmod +x "$temporary"
+  fix_local_binary "$temporary"
+  mv -f "$temporary" "$destination"
+
+  printf '%s\n' "$destination"
+}
+
+cmd_build() {
+  parse_build_args "$@"
+  local bin_name output
+  bin_name="$(detect_bin "$BIN_REQUEST")"
+  output="$(remote_build_and_copy "$bin_name")"
+  printf 'Hasil build: %s\n' "$output"
+}
+
+cmd_run_local() {
+  parse_build_args "$@"
+  local bin_name output
+  bin_name="$(detect_bin "$BIN_REQUEST")"
+  output="$(remote_build_and_copy "$bin_name")"
+
+  printf 'Menjalankan lokal: %s\n' "$output"
+  exec "$output" "${PROGRAM_ARGS[@]}"
+}
+
+cleanup_tunnel() {
+  if [[ -n "${TUNNEL_PID:-}" ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    kill "$TUNNEL_PID" 2>/dev/null || true
+    wait "$TUNNEL_PID" 2>/dev/null || true
+  fi
+}
+
+cmd_dev() {
+  parse_build_args "$@"
+  local bin_name
+  bin_name="$(detect_bin "$BIN_REQUEST")"
+
+  sync_source
+
+  ssh \
+    -p "$VPS_SSH_PORT" \
+    -o BatchMode=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -N \
+    -L "127.0.0.1:${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}" \
+    "$VPS_SSH" &
+  TUNNEL_PID=$!
+  trap cleanup_tunnel EXIT INT TERM
+
+  sleep 1
+  kill -0 "$TUNNEL_PID" 2>/dev/null \
+    || fail "SSH tunnel gagal dibuat."
+
+  printf 'Tunnel aktif: http://localhost:%s -> container:%s\n' "$LOCAL_PORT" "$APP_PORT"
+  printf 'Aplikasi harus listen pada 0.0.0.0:%s di dalam container.\n' "$APP_PORT"
+
+  local release_args=()
+  [[ "$RELEASE" -eq 1 ]] && release_args=(--release)
+
+  compose exec \
+    -e HOST=0.0.0.0 \
+    -e PORT="$APP_PORT" \
+    -e APP_PORT="$APP_PORT" \
+    workspace \
+    cargo run "${release_args[@]}" --bin "$bin_name" "${CARGO_ARGS[@]}" -- "${PROGRAM_ARGS[@]}"
+}
+
+cmd_check() {
+  sync_source
+  compose exec -T workspace cargo check "$@"
+}
+
+cmd_test() {
+  sync_source
+  compose exec -T workspace cargo test "$@"
+}
+
+cmd_stop() {
+  ensure_workspace
+  compose exec -T workspace sh -lc '
+    pkill -INT -f "cargo run" 2>/dev/null || true
+    pkill -INT -f "/workspace/target/(debug|release)/" 2>/dev/null || true
+  '
+  printf 'Proses aplikasi remote dihentikan. Cache tetap disimpan.\n'
+}
+
+cmd_clean() {
+  compose down --volumes --remove-orphans || true
+  rm -rf "${ROOT}/target/remote"
+  printf 'Container, network, source mirror, dan target cache project telah dihapus dari VPS.\n'
+  printf 'Image builder dan cache Cargo bersama tetap disimpan.\n'
+}
+
+remove_filtered() {
+  local resource="$1"
+  shift
+  local values
+  values="$(docker "$resource" ls -q "$@" 2>/dev/null || true)"
+  if [[ -n "$values" ]]; then
+    # shellcheck disable=SC2086
+    docker "$resource" rm -f $values >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_purge() {
+  cmd_clean
+
+  local containers networks volumes
+  containers="$(docker ps -aq --filter label=com.boilerplate-compile.managed=true)"
+  [[ -z "$containers" ]] || docker rm -f $containers >/dev/null
+
+  networks="$(docker network ls -q --filter label=com.boilerplate-compile.managed=true)"
+  [[ -z "$networks" ]] || docker network rm $networks >/dev/null 2>&1 || true
+
+  volumes="$(docker volume ls -q --filter label=com.boilerplate-compile.managed=true)"
+  [[ -z "$volumes" ]] || docker volume rm -f $volumes >/dev/null
+
+  docker image rm -f "$IMAGE_NAME" >/dev/null 2>&1 || true
+  printf 'Seluruh resource boilerplate-compile pada VPS telah dihapus.\n'
+}
+
+cmd_status() {
+  printf 'Project ID : %s\n' "$PROJECT_ID"
+  printf 'VPS        : %s\n' "$VPS_SSH"
+  printf 'Docker URI : %s\n' "$DOCKER_HOST"
+  printf 'Port       : localhost:%s -> VPS 127.0.0.1:%s -> container:%s\n' \
+    "$LOCAL_PORT" "$REMOTE_PORT" "$APP_PORT"
+  compose ps || true
+  docker volume ls --filter "label=com.boilerplate-compile.project=${PROJECT_ID}" || true
+}
+
+cmd_doctor() {
+  printf 'SSH dan Docker VPS dapat diakses.\n'
+  docker version --format 'Docker server: {{.Server.Version}}'
+  "${COMPOSE[@]}" version
+}
+
+usage() {
+  cat <<'HELP'
+Penggunaan:
+  boilerplate-compile doctor
+  boilerplate-compile build [--release] [--bin NAMA] [cargo-args]
+  boilerplate-compile run-local [--release] [--bin NAMA] [cargo-args] -- [arg-program]
+  boilerplate-compile dev [--release] [--bin NAMA] [cargo-args] -- [arg-program]
+  boilerplate-compile check [cargo-args]
+  boilerplate-compile test [cargo-args]
+  boilerplate-compile stop
+  boilerplate-compile clean
+  boilerplate-compile purge
+  boilerplate-compile status
+
+Ringkas:
+  build      Compile di VPS dan salin binary ke target/remote.
+  run-local  Compile di VPS, salin, lalu jalankan binary di NixOS.
+  dev        Jalankan aplikasi di VPS dan akses melalui localhost via SSH tunnel.
+  clean      Hapus seluruh resource VPS milik project saat ini.
+  purge      Hapus semua resource boilerplate-compile, termasuk cache bersama.
+HELP
+}
+
+main() {
+  ensure_project_id
+
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+
+  preflight
+
+  case "$command" in
+    doctor) cmd_doctor "$@" ;;
+    build) cmd_build "$@" ;;
+    run-local|run) cmd_run_local "$@" ;;
+    dev) cmd_dev "$@" ;;
+    check) cmd_check "$@" ;;
+    test) cmd_test "$@" ;;
+    stop) cmd_stop "$@" ;;
+    clean) cmd_clean "$@" ;;
+    purge) cmd_purge "$@" ;;
+    status) cmd_status "$@" ;;
+    *)
+      usage >&2
+      fail "Perintah tidak dikenal: $command"
+      ;;
+  esac
+}
+
+main "$@"
