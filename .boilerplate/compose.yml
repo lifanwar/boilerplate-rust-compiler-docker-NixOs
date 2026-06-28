@@ -4,19 +4,32 @@ services:
     build:
       context: ./docker
       dockerfile: Dockerfile
+
     init: true
     working_dir: /workspace
     command: ["sleep", "infinity"]
+
     environment:
       CARGO_TARGET_DIR: /workspace/target
       CARGO_TERM_COLOR: always
+
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /sccache
+      SCCACHE_CACHE_SIZE: ${SCCACHE_CACHE_SIZE:-7G}
+      SCCACHE_BASEDIRS: /workspace
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      CARGO_INCREMENTAL: "0"
+
     volumes:
       - source:/workspace
       - target:/workspace/target
       - cargo_registry:/usr/local/cargo/registry
       - cargo_git:/usr/local/cargo/git
+      - sccache:/sccache
+
     ports:
       - "127.0.0.1:${REMOTE_PORT}:${APP_PORT}"
+
     labels:
       com.boilerplate-compile.managed: "true"
       com.boilerplate-compile.project: "${PROJECT_ID}"
@@ -26,16 +39,23 @@ volumes:
     labels:
       com.boilerplate-compile.managed: "true"
       com.boilerplate-compile.project: "${PROJECT_ID}"
+
   target:
     labels:
       com.boilerplate-compile.managed: "true"
       com.boilerplate-compile.project: "${PROJECT_ID}"
+
   cargo_registry:
     external: true
     name: boilerplate-compile-cargo-registry
+
   cargo_git:
     external: true
     name: boilerplate-compile-cargo-git
+
+  sccache:
+    external: true
+    name: boilerplate-compile-sccache
 
 networks:
   default:

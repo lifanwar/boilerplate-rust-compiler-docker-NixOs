@@ -9,6 +9,7 @@ CONFIG_FILE="${BOILERPLATE_CONFIG:-${ROOT}/.boilerplate.env}"
 IMAGE_NAME="boilerplate-compile-rust:stable"
 SHARED_REGISTRY="boilerplate-compile-cargo-registry"
 SHARED_GIT="boilerplate-compile-cargo-git"
+SHARED_SCCACHE="boilerplate-compile-sccache"
 
 cd "$ROOT"
 mkdir -p "$STATE_DIR"
@@ -128,6 +129,12 @@ ensure_shared_volumes() {
       --label com.boilerplate-compile.managed=true \
       --label com.boilerplate-compile.shared=true \
       "$SHARED_GIT" >/dev/null
+
+  docker volume inspect "$SHARED_SCCACHE" >/dev/null 2>&1 \
+    || docker volume create \
+      --label com.boilerplate-compile.managed=true \
+      --label com.boilerplate-compile.shared=true \
+      "$SHARED_SCCACHE" >/dev/null
 }
 
 ensure_builder_image() {
@@ -268,6 +275,9 @@ remote_build_and_copy() {
   compose exec -T workspace \
     cargo build "${release_args[@]}" --bin "$bin_name" "${CARGO_ARGS[@]}"
 
+  compose exec -T workspace \
+    sccache --show-stats >&2 || true
+
   local output_dir="${ROOT}/target/remote/${profile}"
   local destination="${output_dir}/${bin_name}"
   local temporary="${destination}.tmp"
@@ -284,6 +294,11 @@ remote_build_and_copy() {
   mv -f "$temporary" "$destination"
 
   printf '%s\n' "$destination"
+}
+
+cmd_sccache_stats() {
+  ensure_workspace
+  compose exec -T workspace sccache --show-stats
 }
 
 cmd_build() {
@@ -426,6 +441,7 @@ Penggunaan:
   boilerplate-compile dev [--release] [--bin NAMA] [cargo-args] -- [arg-program]
   boilerplate-compile check [cargo-args]
   boilerplate-compile test [cargo-args]
+  boilerplate-compile sccache-stats
   boilerplate-compile stop
   boilerplate-compile clean
   boilerplate-compile purge
@@ -461,6 +477,7 @@ main() {
     run-local|run) cmd_run_local "$@" ;;
     dev) cmd_dev "$@" ;;
     check) cmd_check "$@" ;;
+    sccache-stats) cmd_sccache_stats "$@" ;;
     test) cmd_test "$@" ;;
     stop) cmd_stop "$@" ;;
     clean) cmd_clean "$@" ;;
