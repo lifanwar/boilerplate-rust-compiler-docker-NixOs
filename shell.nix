@@ -47,6 +47,11 @@ pkgs.mkShell {
     export BOILERPLATE_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}"
     export BOILERPLATE_DYNAMIC_LINKER="$(cat ${pkgs.stdenv.cc}/nix-support/dynamic-linker)"
 
-    echo "boilerplate-compile siap. Jalankan: boilerplate-compile help"
+    compile() {
+      boilerplate-compile "$@"
+    }
+    export -f compile
+  
+    echo "boilerplate-compile siap. Jalankan: compile help"
   '';
 }
