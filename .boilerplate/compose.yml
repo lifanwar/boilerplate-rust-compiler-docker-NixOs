@@ -17,6 +17,11 @@ services:
       - cargo_git:/usr/local/cargo/git
     ports:
       - "127.0.0.1:${REMOTE_PORT}:${APP_PORT}"
+    mem_limit: 300m
+    memswap_limit: 768m
+    cpus: "0.50"
+    environment:
+      CARGO_BUILD_JOBS: "1"
     labels:
       com.boilerplate-compile.managed: "true"
       com.boilerplate-compile.project: "${PROJECT_ID}"
