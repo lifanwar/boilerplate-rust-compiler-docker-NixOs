@@ -10,6 +10,7 @@ services:
     environment:
       CARGO_TARGET_DIR: /workspace/target
       CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: "1"
     volumes:
       - source:/workspace
       - target:/workspace/target
@@ -20,8 +21,6 @@ services:
     mem_limit: 300m
     memswap_limit: 768m
     cpus: "0.50"
-    environment:
-      CARGO_BUILD_JOBS: "1"
     labels:
       com.boilerplate-compile.managed: "true"
       com.boilerplate-compile.project: "${PROJECT_ID}"
