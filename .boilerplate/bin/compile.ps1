@@ -3,10 +3,14 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "../..")).Path
-$ComposeFile = Join-Path $Root ".boilerplate/compose-windows.yml"
 $StateDir = Join-Path $Root ".boilerplate/state"
 $ConfigFile = if ($env:BOILERPLATE_CONFIG) { $env:BOILERPLATE_CONFIG } else { Join-Path $Root ".boilerplate.env" }
-$ImageName = "boilerplate-compile-rust-windows:stable"
+
+$script:ComposeFile = ""
+$script:ImageName = ""
+$script:BinaryExt = ""
+$script:TargetMode = "linux"
+
 $SharedRegistry = "boilerplate-compile-cargo-registry"
 $SharedGit = "boilerplate-compile-cargo-git"
 
@@ -41,12 +45,30 @@ function Import-BoilerplateEnv {
 
 Import-BoilerplateEnv $ConfigFile
 
+# ── Mode: pilih compose file + image + target sesuai command ──────────
+function Set-TargetMode {
+    param([string]$Mode)
+
+    $script:TargetMode = $Mode
+    if ($Mode -eq "windows") {
+        $script:ComposeFile = Join-Path $Root ".boilerplate/compose-windows.yml"
+        $script:ImageName = "boilerplate-compile-rust-windows:stable"
+        $script:BinaryExt = ".exe"
+    } else {
+        $script:ComposeFile = Join-Path $Root ".boilerplate/compose.yml"
+        $script:ImageName = "boilerplate-compile-rust:stable"
+        $script:BinaryExt = ""
+    }
+}
+
+# Set default mode (linux) — akan di-override per command
+Set-TargetMode "linux"
+
 $VpsSsh = if ($env:VPS_SSH) { $env:VPS_SSH } else { "" }
 $VpsSshPort = if ($env:VPS_SSH_PORT) { $env:VPS_SSH_PORT } else { "22" }
 $AppPort = if ($env:APP_PORT) { $env:APP_PORT } else { "3000" }
 $LocalPort = if ($env:LOCAL_PORT) { $env:LOCAL_PORT } else { $AppPort }
 $RustTarget = if ($env:RUST_TARGET -and $env:RUST_TARGET -ne "auto") { $env:RUST_TARGET } else { "x86_64-pc-windows-gnu" }
-$BinaryExt = ".exe"
 
 function Fail {
     param([string]$Message)
@@ -91,8 +113,10 @@ function Ensure-ProjectId {
             $name = "rust-project"
         }
 
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         $bytes = New-Object byte[] 4
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        $rng.GetBytes($bytes)
+        $rng.Dispose()
         $random = -join ($bytes | ForEach-Object { $_.ToString("x2") })
         "$name-$random" | Set-Content -NoNewline $idFile
     }
@@ -138,7 +162,7 @@ function Invoke-Compose {
 
     $composeArgs = @(
         "--project-directory", (Join-Path $Root ".boilerplate")
-        "-f", $ComposeFile
+        "-f", $script:ComposeFile
         "-p", $script:ComposeProjectName
     ) + $Args
 
@@ -203,9 +227,15 @@ function Get-FileHashText {
 }
 
 function Ensure-BuilderImage {
-    $hashFile = Join-Path $StateDir "builder-windows-hash"
-    $dockerfile = Join-Path $Root ".boilerplate/docker/Dockerfile.windows"
+    $hashFile = Join-Path $StateDir "builder-$($script:TargetMode)-hash"
+    $dockerfile = if ($script:TargetMode -eq "windows") {
+        Join-Path $Root ".boilerplate/docker/Dockerfile.windows"
+    } else {
+        Join-Path $Root ".boilerplate/docker/Dockerfile"
+    }
+
     if (-not (Test-Path $dockerfile)) {
+        # fallback ke Dockerfile umum
         $dockerfile = Join-Path $Root ".boilerplate/docker/Dockerfile"
     }
 
@@ -215,11 +245,11 @@ function Ensure-BuilderImage {
         $previousHash = (Get-Content $hashFile -Raw).Trim()
     }
 
-    docker image inspect $ImageName *> $null
+    docker image inspect $script:ImageName *> $null
     $imageMissing = $LASTEXITCODE -ne 0
 
     if ($imageMissing -or $currentHash -ne $previousHash) {
-        Write-Host "Membangun image builder di VPS..."
+        Write-Host "Membangun image builder ($($script:TargetMode)) di VPS..."
         Invoke-Compose build workspace
         $currentHash | Set-Content -NoNewline $hashFile
     }
@@ -323,21 +353,36 @@ function Remote-BuildAndCopy {
 
     Sync-Source
 
-    Write-Host "Compile $BinName untuk Windows di VPS..."
-    $buildArgs = @("exec", "-T", "workspace", "cargo", "build") +
-        $releaseArgs +
-        @("--target", $RustTarget, "--bin", $BinName) +
-        $script:CargoArgs
-    Invoke-Compose @buildArgs
+    if ($script:TargetMode -eq "windows") {
+        Write-Host "Compile $BinName untuk Windows di VPS..."
+        $buildArgs = @("exec", "-T", "workspace", "cargo", "build") +
+            $releaseArgs +
+            @("--target", $RustTarget, "--bin", $BinName) +
+            $script:CargoArgs
 
-    $outputDir = Join-Path $Root "target/remote/windows/$profile"
-    $destination = Join-Path $outputDir "$BinName$BinaryExt"
-    $temporary = "$destination.tmp"
+        $outputDir = Join-Path $Root "target/remote/windows/$profile"
+        $destination = Join-Path $outputDir "$BinName$script:BinaryExt"
+        $temporary = "$destination.tmp"
+        $containerPath = "/workspace/target/$RustTarget/$profile/$BinName$script:BinaryExt"
+    } else {
+        Write-Host "Compile $BinName untuk Linux di VPS..."
+        $buildArgs = @("exec", "-T", "workspace", "cargo", "build") +
+            $releaseArgs +
+            @("--bin", $BinName) +
+            $script:CargoArgs
+
+        $outputDir = Join-Path $Root "target/remote/linux/$profile"
+        $destination = Join-Path $outputDir "$BinName"
+        $temporary = "$destination.tmp"
+        $containerPath = "/workspace/target/$profile/$BinName"
+    }
+
+    Invoke-Compose @buildArgs
 
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     Remove-Item -Force -ErrorAction SilentlyContinue $temporary
 
-    Invoke-Compose cp "workspace:/workspace/target/$RustTarget/$profile/$BinName$BinaryExt" $temporary
+    Invoke-Compose cp "workspace:$containerPath" $temporary
     Move-Item -Force $temporary $destination
 
     return $destination
@@ -345,6 +390,7 @@ function Remote-BuildAndCopy {
 
 function Cmd-Build {
     param([string[]]$Args)
+    Set-TargetMode "windows"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
     $output = Remote-BuildAndCopy $binName
@@ -353,6 +399,7 @@ function Cmd-Build {
 
 function Cmd-RunLocal {
     param([string[]]$Args)
+    Set-TargetMode "windows"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
     $output = Remote-BuildAndCopy $binName
@@ -365,6 +412,7 @@ function Cmd-RunLocal {
 
 function Cmd-Dev {
     param([string[]]$Args)
+    Set-TargetMode "linux"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
 
@@ -404,7 +452,7 @@ function Cmd-Dev {
             "cargo",
             "run"
         ) + $releaseArgs +
-            @("--target", $RustTarget, "--bin", $binName) +
+            @("--bin", $binName) +
             $script:CargoArgs +
             @("--") +
             $script:ProgramArgs
@@ -418,23 +466,27 @@ function Cmd-Dev {
 
 function Cmd-Check {
     param([string[]]$Args)
+    Set-TargetMode "linux"
     Sync-Source
-    Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "check", "--target", $RustTarget) + $Args)
+    Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "check") + $Args)
 }
 
 function Cmd-Test {
     param([string[]]$Args)
+    Set-TargetMode "linux"
     Sync-Source
-    Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "test", "--target", $RustTarget) + $Args)
+    Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "test") + $Args)
 }
 
 function Cmd-Stop {
+    Set-TargetMode "linux"
     Ensure-Workspace
     Invoke-Compose exec -T workspace sh -lc 'pkill -INT -f "cargo run" 2>/dev/null || true; pkill -INT -f "/workspace/target/.*/(debug|release)/" 2>/dev/null || true'
     Write-Host "Proses aplikasi remote dihentikan. Cache tetap disimpan."
 }
 
 function Cmd-Clean {
+    Set-TargetMode "linux"
     Invoke-Compose down --volumes --remove-orphans
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Root "target/remote")
     Write-Host "Container, network, source mirror, dan target cache project telah dihapus dari VPS."
@@ -442,6 +494,7 @@ function Cmd-Clean {
 }
 
 function Cmd-Purge {
+    Set-TargetMode "linux"
     Cmd-Clean
 
     $containers = docker ps -aq --filter label=com.boilerplate-compile.managed=true
@@ -459,11 +512,12 @@ function Cmd-Purge {
         docker volume rm -f @volumes *> $null
     }
 
-    docker image rm -f $ImageName *> $null
+    docker image rm -f $script:ImageName *> $null
     Write-Host "Seluruh resource boilerplate-compile pada VPS telah dihapus."
 }
 
 function Cmd-Status {
+    Set-TargetMode "linux"
     Write-Host "Project ID : $script:ProjectId"
     Write-Host "VPS        : $VpsSsh"
     Write-Host "Docker URI : $env:DOCKER_HOST"
@@ -499,20 +553,23 @@ Penggunaan:
 
 Ringkas:
   build      Compile Windows .exe di VPS dan salin ke target/remote/windows.
-  run-local  Compile di VPS, salin, lalu jalankan .exe di Windows lokal.
-  dev        Jalankan aplikasi di container VPS dan akses via localhost SSH tunnel.
-  clean      Hapus seluruh resource VPS milik project saat ini.
-  purge      Hapus semua resource boilerplate-compile, termasuk cache bersama.
+  run-local  Compile .exe di VPS, salin, lalu jalankan di Windows lokal.
+  dev        Compile + jalankan server di container Linux VPS, akses via SSH tunnel.
+  check      Cek kode dengan compiler Linux di container VPS.
+  test       Jalankan test di container Linux VPS.
+  stop       Hentikan aplikasi server di VPS.
+  clean      Hapus resource VPS milik project saat ini.
+  purge      Hapus semua resource boilerplate-compile di VPS.
 "@
 }
 
 function Main {
-    param([string[]]$Args)
+    param([string[]]$Clause)
 
     Ensure-ProjectId
 
-    $command = if ($Args.Count -gt 0) { $Args[0] } else { "help" }
-    $rest = if ($Args.Count -gt 1) { $Args[1..($Args.Count - 1)] } else { @() }
+    $command = if ($Clause.Count -gt 0) { $Clause[0] } else { "help" }
+    $rest = if ($Clause.Count -gt 1) { $Clause[1..($Clause.Count - 1)] } else { @() }
 
     switch ($command) {
         "help" { Usage; exit 0 }

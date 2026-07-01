@@ -3,3 +3,5 @@
 /.boilerplate/state/*
 !/.boilerplate/state/.gitkeep
 *.log
+/src
+Cargo.toml
