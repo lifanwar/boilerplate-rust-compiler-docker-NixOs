@@ -21,6 +21,7 @@ function Import-BoilerplateEnv {
     param([string]$Path)
 
     if (-not (Test-Path $Path)) {
+        Write-Host "[WARN] File config '$Path' tidak ditemukan."
         return
     }
 
@@ -70,6 +71,12 @@ $AppPort = if ($env:APP_PORT) { $env:APP_PORT } else { "3000" }
 $LocalPort = if ($env:LOCAL_PORT) { $env:LOCAL_PORT } else { $AppPort }
 $RustTarget = if ($env:RUST_TARGET -and $env:RUST_TARGET -ne "auto") { $env:RUST_TARGET } else { "x86_64-pc-windows-gnu" }
 
+function Log {
+    param([string]$Message)
+    $time = Get-Date -Format "HH:mm:ss"
+    Write-Host "[$time] $Message"
+}
+
 function Fail {
     param([string]$Message)
     Write-Error "Error: $Message"
@@ -105,6 +112,7 @@ function Ensure-ProjectId {
     $idFile = Join-Path $StateDir "project-id"
 
     if (-not (Test-Path $idFile) -or ((Get-Item $idFile).Length -eq 0)) {
+        Log "Membuat project ID baru..."
         $name = Safe-Name (Package-Name)
         if (-not $name) {
             $name = Safe-Name (Split-Path -Leaf $Root)
@@ -140,6 +148,8 @@ function Ensure-ProjectId {
     $env:LOCAL_PORT = $LocalPort
     $env:REMOTE_PORT = "$script:RemotePort"
     $env:RUST_TARGET = $RustTarget
+
+    Log "Project ID: $script:ProjectId"
 }
 
 function Select-Compose {
@@ -158,13 +168,11 @@ function Select-Compose {
 }
 
 function Invoke-Compose {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-
     $composeArgs = @(
         "--project-directory", (Join-Path $Root ".boilerplate")
         "-f", $script:ComposeFile
         "-p", $script:ComposeProjectName
-    ) + $Args
+    ) + $args
 
     if ($script:ComposeMode -eq "docker-compose-plugin") {
         & docker compose @composeArgs
@@ -184,6 +192,7 @@ function Configure-Remote {
 }
 
 function Preflight {
+    Log "Memeriksa prerequisite..."
     Need "cargo"
     Need "docker"
     Need "ssh"
@@ -192,15 +201,19 @@ function Preflight {
     Configure-Remote
     Select-Compose
 
+    Log "Menguji koneksi SSH ke ${VpsSsh}:${VpsSshPort}..."
     ssh -p $VpsSshPort -o BatchMode=yes -o ConnectTimeout=10 $VpsSsh true
     if ($LASTEXITCODE -ne 0) {
-        Fail "SSH ke $VpsSsh gagal."
+        Fail "SSH ke $VpsSsh gagal. Cek koneksi dan SSH key."
     }
+    Log "SSH OK"
 
+    Log "Mengakses Docker daemon via SSH..."
     docker info *> $null
     if ($LASTEXITCODE -ne 0) {
         Fail "Docker daemon pada VPS tidak dapat diakses oleh $VpsSsh."
     }
+    Log "Docker daemon OK"
 }
 
 function Ensure-SharedVolumes {
@@ -245,33 +258,57 @@ function Ensure-BuilderImage {
         $previousHash = (Get-Content $hashFile -Raw).Trim()
     }
 
-    docker image inspect $script:ImageName *> $null
-    $imageMissing = $LASTEXITCODE -ne 0
+    $imageMissing = $true
+    try {
+        $null = docker image inspect $script:ImageName 2>$null
+        if ($LASTEXITCODE -eq 0) { $imageMissing = $false }
+    } catch { }
 
     if ($imageMissing -or $currentHash -ne $previousHash) {
-        Write-Host "Membangun image builder ($($script:TargetMode)) di VPS..."
+        Log "Membangun image builder ($($script:TargetMode)) di VPS (Dockerfile berubah/baru)..."
+        $env:BUILDKIT_PROGRESS = "plain"
         Invoke-Compose build workspace
+        Remove-Item Env:BUILDKIT_PROGRESS -ErrorAction SilentlyContinue
         $currentHash | Set-Content -NoNewline $hashFile
+        Log "Image builder selesai dibangun"
+    } else {
+        Log "Image builder ($($script:TargetMode)) sudah ada dan up-to-date"
     }
 }
 
 function Ensure-Workspace {
     Ensure-SharedVolumes
     Ensure-BuilderImage
-    Invoke-Compose up -d workspace *> $null
+
+    $containerId = Invoke-Compose ps -a -q workspace 2>$null
+    if ($containerId) {
+        Log "Menyalakan container workspace yang sudah ada..."
+        Invoke-Compose start workspace
+        Log "Container workspace aktif"
+    } else {
+        Log "Membuat container workspace baru..."
+        Invoke-Compose create workspace 2>$null
+        Invoke-Compose start workspace
+        Log "Container workspace siap"
+    }
 }
 
 function Ensure-Lockfile {
     if (-not (Test-Path (Join-Path $Root "Cargo.lock"))) {
-        Write-Host "Membuat Cargo.lock lokal..."
+        Log "Membuat Cargo.lock lokal..."
         cargo generate-lockfile
+        Log "Cargo.lock selesai"
+    } else {
+        Log "Cargo.lock sudah ada"
     }
 }
 
 function Sync-Source {
     Ensure-Lockfile
     Ensure-Workspace
-    Write-Host "Mengirim source ke workspace VPS..."
+    Log "Membuat arsip source..."
+    $syncStart = Get-Date
+    $tmpTar = Join-Path $env:TEMP "boilerplate-sync-$PID.tar"
 
     tar `
         --exclude="./.git" `
@@ -281,10 +318,28 @@ function Sync-Source {
         --exclude="./.direnv" `
         --exclude="./.boilerplate.env" `
         --exclude="./.boilerplate/state" `
-        -C $Root -cf - . |
-        Invoke-Compose exec -T workspace sh -lc "find /workspace -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf -- {} + && tar -xf - -C /workspace"
-}
+        -C $Root -cf $tmpTar .
 
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $tmpTar -Force -ErrorAction SilentlyContinue
+        Fail "Gagal membuat arsip source"
+    }
+    Log "Mengirim arsip ke container VPS..."
+    Invoke-Compose cp $tmpTar workspace:/tmp/boilerplate-sync.tar
+
+    Log "Mengekstrak di container..."
+    Invoke-Compose exec -T workspace sh -lc "find /workspace -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf -- {} + && tar -xf /tmp/boilerplate-sync.tar -C /workspace && rm /tmp/boilerplate-sync.tar"
+    $extractOk = $LASTEXITCODE
+
+    Remove-Item $tmpTar -Force -ErrorAction SilentlyContinue
+
+    if ($extractOk -ne 0) {
+        Fail "Sync source gagal dengan kode error $extractOk"
+    }
+
+    $elapsed = [math]::Round(((Get-Date) - $syncStart).TotalSeconds, 1)
+    Log ("Source berhasil dikirim (" + $elapsed + "s)")
+}
 function Detect-Bin {
     param([string]$Requested)
 
@@ -354,7 +409,7 @@ function Remote-BuildAndCopy {
     Sync-Source
 
     if ($script:TargetMode -eq "windows") {
-        Write-Host "Compile $BinName untuk Windows di VPS..."
+        Log "Compile $BinName untuk Windows di VPS..."
         $buildArgs = @("exec", "-T", "workspace", "cargo", "build") +
             $releaseArgs +
             @("--target", $RustTarget, "--bin", $BinName) +
@@ -365,7 +420,7 @@ function Remote-BuildAndCopy {
         $temporary = "$destination.tmp"
         $containerPath = "/workspace/target/$RustTarget/$profile/$BinName$script:BinaryExt"
     } else {
-        Write-Host "Compile $BinName untuk Linux di VPS..."
+        Log "Compile $BinName untuk Linux di VPS..."
         $buildArgs = @("exec", "-T", "workspace", "cargo", "build") +
             $releaseArgs +
             @("--bin", $BinName) +
@@ -377,34 +432,41 @@ function Remote-BuildAndCopy {
         $containerPath = "/workspace/target/$profile/$BinName"
     }
 
+    $buildStart = Get-Date
     Invoke-Compose @buildArgs
+    $elapsed = [math]::Round(((Get-Date) - $buildStart).TotalSeconds, 1)
+    Log "Build selesai ($elapseds)"
 
+    Log "Menyalin binary dari container ke $destination..."
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     Remove-Item -Force -ErrorAction SilentlyContinue $temporary
 
     Invoke-Compose cp "workspace:$containerPath" $temporary
     Move-Item -Force $temporary $destination
+    Log "Binary disalin: $destination"
 
     return $destination
 }
 
 function Cmd-Build {
     param([string[]]$Args)
+    Log "=== BUILD ==="
     Set-TargetMode "windows"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
     $output = Remote-BuildAndCopy $binName
-    Write-Host "Hasil build: $output"
+    Log "Hasil build: $output"
 }
 
 function Cmd-RunLocal {
     param([string[]]$Args)
+    Log "=== RUN-LOCAL ==="
     Set-TargetMode "windows"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
     $output = Remote-BuildAndCopy $binName
 
-    Write-Host "Menjalankan lokal: $output"
+    Log "Menjalankan lokal: $output"
     $programArgs = $script:ProgramArgs
     & $output @programArgs
     exit $LASTEXITCODE
@@ -412,14 +474,15 @@ function Cmd-RunLocal {
 
 function Cmd-Dev {
     param([string[]]$Args)
+    Log "=== DEV ==="
     Set-TargetMode "linux"
     Parse-BuildArgs $Args
     $binName = Detect-Bin $script:BinRequest
 
     Sync-Source
 
-    Write-Host "Tunnel aktif: http://localhost:$LocalPort -> container:$AppPort"
-    Write-Host "Aplikasi harus listen pada 0.0.0.0:$AppPort di dalam container."
+    Log "Membuat SSH tunnel: localhost:$LocalPort -> container:$AppPort"
+    Log "Aplikasi harus listen pada 0.0.0.0:$AppPort di dalam container."
 
     $sshArgs = @(
         "-p", $VpsSshPort,
@@ -437,6 +500,7 @@ function Cmd-Dev {
         if ($tunnel.HasExited) {
             Fail "SSH tunnel gagal dibuat."
         }
+        Log "SSH tunnel berhasil"
 
         $releaseArgs = @()
         if ($script:Release) {
@@ -456,6 +520,7 @@ function Cmd-Dev {
             $script:CargoArgs +
             @("--") +
             $script:ProgramArgs
+        Log "Menjalankan cargo run di container..."
         Invoke-Compose @runArgs
     } finally {
         if ($tunnel -and -not $tunnel.HasExited) {
@@ -466,68 +531,88 @@ function Cmd-Dev {
 
 function Cmd-Check {
     param([string[]]$Args)
+    Log "=== CHECK ==="
     Set-TargetMode "linux"
     Sync-Source
+    Log "Menjalankan cargo check di container..."
     Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "check") + $Args)
+    Log "cargo check selesai (exit code: $LASTEXITCODE)"
 }
 
 function Cmd-Test {
     param([string[]]$Args)
+    Log "=== TEST ==="
     Set-TargetMode "linux"
     Sync-Source
+    Log "Menjalankan cargo test di container..."
     Invoke-Compose @(@("exec", "-T", "workspace", "cargo", "test") + $Args)
+    Log "cargo test selesai (exit code: $LASTEXITCODE)"
 }
 
 function Cmd-Stop {
+    Log "=== STOP ==="
     Set-TargetMode "linux"
     Ensure-Workspace
+    Log "Menghentikan proses aplikasi di container..."
     Invoke-Compose exec -T workspace sh -lc 'pkill -INT -f "cargo run" 2>/dev/null || true; pkill -INT -f "/workspace/target/.*/(debug|release)/" 2>/dev/null || true'
-    Write-Host "Proses aplikasi remote dihentikan. Cache tetap disimpan."
+    Log "Proses aplikasi remote dihentikan. Cache tetap disimpan."
 }
 
 function Cmd-Clean {
+    Log "=== CLEAN ==="
     Set-TargetMode "linux"
+    Log "Menghapus container dan volume project dari VPS..."
     Invoke-Compose down --volumes --remove-orphans
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $Root "target/remote")
-    Write-Host "Container, network, source mirror, dan target cache project telah dihapus dari VPS."
-    Write-Host "Image builder dan cache Cargo bersama tetap disimpan."
+    Log "Container, network, source mirror, dan target cache project telah dihapus dari VPS."
+    Log "Image builder dan cache Cargo bersama tetap disimpan."
 }
 
 function Cmd-Purge {
+    Log "=== PURGE ==="
     Set-TargetMode "linux"
     Cmd-Clean
 
+    Log "Menghapus seluruh container bertanda boilerplate-compile..."
     $containers = docker ps -aq --filter label=com.boilerplate-compile.managed=true
     if ($containers) {
         docker rm -f @containers *> $null
     }
 
+    Log "Menghapus seluruh network bertanda boilerplate-compile..."
     $networks = docker network ls -q --filter label=com.boilerplate-compile.managed=true
     if ($networks) {
         docker network rm @networks *> $null
     }
 
+    Log "Menghapus seluruh volume bertanda boilerplate-compile..."
     $volumes = docker volume ls -q --filter label=com.boilerplate-compile.managed=true
     if ($volumes) {
         docker volume rm -f @volumes *> $null
     }
 
+    Log "Menghapus image builder..."
     docker image rm -f $script:ImageName *> $null
-    Write-Host "Seluruh resource boilerplate-compile pada VPS telah dihapus."
+    Log "Seluruh resource boilerplate-compile pada VPS telah dihapus."
 }
 
 function Cmd-Status {
+    Log "=== STATUS ==="
     Set-TargetMode "linux"
-    Write-Host "Project ID : $script:ProjectId"
-    Write-Host "VPS        : $VpsSsh"
-    Write-Host "Docker URI : $env:DOCKER_HOST"
-    Write-Host "Target     : $RustTarget"
-    Write-Host "Port       : localhost:$LocalPort -> VPS 127.0.0.1:$script:RemotePort -> container:$AppPort"
+    Write-Host "  Project ID : $script:ProjectId"
+    Write-Host "  VPS        : $VpsSsh"
+    Write-Host "  Docker URI : $env:DOCKER_HOST"
+    Write-Host "  Target     : $RustTarget"
+    Write-Host "  Port       : localhost:$LocalPort -> VPS 127.0.0.1:$script:RemotePort -> container:$AppPort"
+    Log "Docker Compose:"
     Invoke-Compose ps
+    Log "Volume project:"
     docker volume ls --filter "label=com.boilerplate-compile.project=$script:ProjectId"
 }
 
 function Cmd-Doctor {
+    Log "=== DOCTOR ==="
+    Log "Memeriksa akses SSH dan Docker..."
     Write-Host "SSH dan Docker VPS dapat diakses."
     docker version --format "Docker server: {{.Server.Version}}"
     if ($script:ComposeMode -eq "docker-compose-plugin") {
