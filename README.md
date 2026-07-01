@@ -1,13 +1,17 @@
 # boilerplate-compile
 
-Boilerplate Rust untuk compile di VPS melalui Docker over SSH. Hasil build dapat dijalankan di NixOS, sementara aplikasi server dapat diakses melalui `localhost` memakai SSH tunnel.
+Boilerplate Rust untuk compile di VPS melalui Docker over SSH. Mendukung **dua mode**:
+- **Linux mode** (`dev` / `check` / `test`) — binary dijalankan di dalam container Linux VPS.
+- **Windows mode** (`build` / `run-local`) — cross-compile ke Windows `.exe` dan dijalankan di lokal.
+
+Dua CLI tersedia: `boilerplate-compile` (bash, untuk NixOS) dan `compile.ps1` (PowerShell, untuk Windows).
 
 ## Fitur
 
-- Build Rust di VPS.
-- Cache `target` per project agar build berikutnya lebih cepat.
-- Build di VPS lalu jalankan binary di NixOS.
-- Jalankan server di VPS tanpa membuka port publik.
+- Build Rust di VPS dengan cache `target` per project.
+- **Windows**: cross-compile `.exe` via `compile.ps1` (PowerShell).
+- **Linux/NixOS**: build native via `boilerplate-compile` (bash).
+- Jalankan server di VPS tanpa membuka port publik (SSH tunnel).
 - Bersihkan resource satu project atau seluruh builder.
 
 ## Prasyarat
@@ -21,7 +25,13 @@ Boilerplate Rust untuk compile di VPS melalui Docker over SSH. Hasil build dapat
 ssh user@IP_VPS
 ```
 
-### VPS
+### Windows (PowerShell)
+
+- [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/) dengan WSL2 backend.
+- SSH client (bawaan Windows 10/11).
+- Rust (opsional, hanya untuk `cargo generate-lockfile` lokal).
+
+### VPS (sama untuk semua platform)
 
 - Docker Engine tersedia.
 - User SSH dapat menjalankan Docker tanpa `sudo`.
@@ -57,6 +67,8 @@ APP_PORT=3000
 LOCAL_PORT=3000
 ```
 
+### Linux / NixOS
+
 Masuk ke development shell:
 
 ```bash
@@ -69,6 +81,14 @@ Tes koneksi SSH dan Docker VPS:
 boilerplate-compile doctor
 ```
 
+### Windows
+
+Pastikan Docker Desktop berjalan, lalu tes koneksi:
+
+```powershell
+.\compile.ps1 doctor
+```
+
 ## Mulai Project
 
 Ubah nama package di `Cargo.toml`:
@@ -77,7 +97,7 @@ Ubah nama package di `Cargo.toml`:
 [package]
 name = "nama-project"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 ```
 
 Tulis program di:
@@ -86,7 +106,19 @@ Tulis program di:
 src/main.rs
 ```
 
-## Perintah
+## Mode
+
+Script secara otomatis memilih mode berdasarkan perintah:
+
+| Perintah | Mode | Compose File | Dockerfile | Hasil |
+|---|---|---|---|---|
+| `build` | **Windows** | `compose-windows.yml` | `Dockerfile.windows` | `.exe` → `target/remote/windows/` |
+| `run-local` | **Windows** | `compose-windows.yml` | `Dockerfile.windows` | `.exe` → dijalankan langsung |
+| `dev` | **Linux** | `compose.yml` | `Dockerfile` | Jalan di container VPS |
+| `check` | **Linux** | `compose.yml` | `Dockerfile` | Cek kode di Linux |
+| `test` | **Linux** | `compose.yml` | `Dockerfile` | Test di Linux |
+
+## Perintah — Linux / NixOS (bash)
 
 ### Build di VPS
 
@@ -175,7 +207,6 @@ boilerplate-compile clean
 ```
 
 Menghapus:
-
 - container project;
 - source mirror di VPS;
 - cache `target` project;
@@ -192,6 +223,61 @@ boilerplate-compile purge
 
 Menghapus seluruh container, volume, network, cache Cargo, dan image milik `boilerplate-compile` pada VPS.
 
+## Perintah — Windows (PowerShell)
+
+Semua perintah dijalankan lewat `compile.ps1`:
+
+### Doctor — Cek Koneksi
+
+```powershell
+.\compile.ps1 doctor
+```
+
+### Build Windows .exe di VPS
+
+```powershell
+.\compile.ps1 build
+.\compile.ps1 build --release
+```
+
+Hasil binary:
+
+```text
+target/remote/windows/debug/nama-project.exe
+target/remote/windows/release/nama-project.exe
+```
+
+### Build .exe lalu Jalankan di Windows Lokal
+
+```powershell
+.\compile.ps1 run-local
+.\compile.ps1 run-local -- --nama Roy
+```
+
+### Dev — Jalankan Server di Container Linux VPS
+
+```powershell
+.\compile.ps1 dev
+```
+
+Akses via SSH tunnel di `http://localhost:3000`.
+
+### Check dan Test (Linux compiler di VPS)
+
+```powershell
+.\compile.ps1 check
+.\compile.ps1 test
+```
+
+### Manajemen
+
+```powershell
+.\compile.ps1 status
+.\compile.ps1 stop
+.\compile.ps1 clean
+.\compile.ps1 purge
+```
+
 ## Cara Kerja
 
 ```text
@@ -201,9 +287,11 @@ container Docker di VPS
     ↓
 cargo build dengan cache project
     ↓
-binary dikirim ke NixOS
+binary dikirim ke lokal
     ↓
-dijalankan lokal atau tetap berjalan di VPS
+Windows: .exe dijalankan di Windows
+Linux:   binary dijalankan di NixOS
+         atau server tetap jalan di container VPS via SSH tunnel
 ```
 
 Build berikutnya lebih cepat karena volume `target` tetap tersedia sampai Anda menjalankan `clean`.
@@ -220,10 +308,13 @@ boilerplate-compile/
 │   └── main.rs
 └── .boilerplate/
     ├── bin/
-    │   └── boilerplate-compile
+    │   ├── boilerplate-compile     # CLI bash (Linux / NixOS)
+    │   └── compile.ps1             # CLI PowerShell (Windows)
     ├── docker/
-    │   └── Dockerfile
-    ├── compose.yml
+    │   ├── Dockerfile              # Linux builder
+    │   └── Dockerfile.windows      # Windows cross-compile builder
+    ├── compose.yml                 # Linux mode
+    ├── compose-windows.yml         # Windows mode
     └── state/
 ```
 
@@ -231,5 +322,6 @@ boilerplate-compile/
 
 - Jangan commit `.boilerplate.env`.
 - Jangan simpan private SSH key di repository.
+- `Cargo.toml` dan `src/` sudah di-`.gitignore` — buat ulang di setiap clone.
 - `clean` hanya menghapus resource project aktif.
 - `purge` menghapus seluruh resource `boilerplate-compile` di VPS.
